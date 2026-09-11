@@ -1,0 +1,272 @@
+name: Build LiveContainer + Official SideStore Nightly
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Every day at 23:00 UTC = 08:00 JST (next day)
+    - cron: "0 23 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    env:
+      scheme: LiveContainer
+      archive_path: archive
+
+    steps:
+      - name: Checkout latest LiveContainer
+        uses: actions/checkout@v6
+        with:
+          repository: LiveContainer/LiveContainer
+          ref: main
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Show LiveContainer revision
+        shell: bash
+        run: |
+          echo "LiveContainer commit:"
+          git rev-parse HEAD
+          git log -1 --oneline
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.2"
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+
+      - name: Determine Xcode project/workspace
+        id: xcode
+        shell: bash
+        run: |
+          if [ -f "LiveContainer.xcworkspace/contents.xcworkspacedata" ]; then
+            echo "filetype_parameter=workspace" >> "$GITHUB_OUTPUT"
+            echo "file_to_build=LiveContainer.xcworkspace" >> "$GITHUB_OUTPUT"
+          elif [ -f "LiveContainer.xcodeproj/project.pbxproj" ]; then
+            echo "filetype_parameter=project" >> "$GITHUB_OUTPUT"
+            echo "file_to_build=LiveContainer.xcodeproj" >> "$GITHUB_OUTPUT"
+          else
+            echo "Could not find LiveContainer Xcode project/workspace."
+            exit 1
+          fi
+
+      - name: Archive LiveContainer
+        shell: bash
+        run: |
+          xcodebuild archive \
+            -archivePath "$archive_path" \
+            -scheme "$scheme" \
+            -"${{ steps.xcode.outputs.filetype_parameter }}" \
+            "${{ steps.xcode.outputs.file_to_build }}" \
+            -sdk iphoneos \
+            -arch arm64 \
+            -configuration Release \
+            | xcpretty && exit ${PIPESTATUS[0]}
+
+      - name: Install ldid
+        shell: bash
+        run: |
+          brew install ldid
+
+      - name: Download dylibify
+        shell: bash
+        run: |
+          curl -L \
+            -o dylibify \
+            https://github.com/LiveContainer/dylibify/releases/download/1.0/dylibify
+          chmod +x dylibify
+
+      - name: Configure official SideStore nightly
+        shell: bash
+        run: |
+          set -e
+
+          SCRIPT=".github/build_github.sh"
+
+          LIVE_CONTAINER_URL="https://github.com/LiveContainer/SideStore/releases/download/nightly/SideStore.ipa"
+          OFFICIAL_SIDESTORE_URL="https://github.com/SideStore/SideStore/releases/download/nightly/SideStore.ipa"
+
+          echo "Checking original SideStore URL..."
+          grep -F "$LIVE_CONTAINER_URL" "$SCRIPT"
+
+          echo "Replacing SideStore source..."
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path(".github/build_github.sh")
+          text = path.read_text()
+
+          old = "https://github.com/LiveContainer/SideStore/releases/download/nightly/SideStore.ipa"
+          new = "https://github.com/SideStore/SideStore/releases/download/nightly/SideStore.ipa"
+
+          if old not in text:
+              raise SystemExit("Original SideStore URL was not found.")
+
+          text = text.replace(old, new)
+
+          path.write_text(text)
+          PY
+
+          echo
+          echo "Updated SideStore source:"
+          grep -F "SideStore.ipa" "$SCRIPT"
+
+          if grep -Fq "$LIVE_CONTAINER_URL" "$SCRIPT"; then
+            echo "ERROR: LiveContainer SideStore URL still exists."
+            exit 1
+          fi
+
+          if ! grep -Fq "$OFFICIAL_SIDESTORE_URL" "$SCRIPT"; then
+            echo "ERROR: Official SideStore URL was not found after patching."
+            exit 1
+          fi
+
+      - name: Build IPA with official LiveContainer integration script
+        shell: bash
+        run: |
+          set -e
+
+          sh .github/build_github.sh
+
+      - name: Verify generated IPAs
+        shell: bash
+        run: |
+          set -e
+
+          test -f "LiveContainer.ipa"
+          test -f "LiveContainer+SideStore.ipa"
+
+          echo "Generated files:"
+          ls -lh \
+            "LiveContainer.ipa" \
+            "LiveContainer+SideStore.ipa"
+
+      - name: Verify integrated official SideStore
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf verify
+          mkdir -p verify
+
+          unzip -q "LiveContainer+SideStore.ipa" -d verify
+
+          SIDESTORE_INFO="verify/Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Info.plist"
+
+          if [ ! -f "$SIDESTORE_INFO" ]; then
+            echo "ERROR: SideStoreApp.framework was not found."
+            exit 1
+          fi
+
+          echo "SideStore bundle information:"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$SIDESTORE_INFO"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$SIDESTORE_INFO"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$SIDESTORE_INFO"
+
+          BUNDLE_ID=$(
+            /usr/libexec/PlistBuddy \
+              -c "Print :CFBundleIdentifier" \
+              "$SIDESTORE_INFO"
+          )
+
+          if [ "$BUNDLE_ID" != "com.SideStore.SideStore" ]; then
+            echo "ERROR: Unexpected SideStore bundle identifier: $BUNDLE_ID"
+            exit 1
+          fi
+
+          echo "Official SideStore integration verified."
+
+      - name: Calculate SHA256
+        shell: bash
+        run: |
+          echo "SHA256:"
+          shasum -a 256 "LiveContainer.ipa"
+          shasum -a 256 "LiveContainer+SideStore.ipa"
+
+      - name: Create build information
+        shell: bash
+        run: |
+          {
+            echo "LiveContainer + Official SideStore Nightly"
+            echo
+            echo "LiveContainer commit:"
+            git rev-parse HEAD
+            git log -1 --oneline
+            echo
+            echo "Xcode:"
+            xcodebuild -version
+            echo
+            echo "SideStore:"
+            unzip -p "LiveContainer+SideStore.ipa" \
+              "Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Info.plist" \
+              > /tmp/sidestore-info.plist
+
+            /usr/libexec/PlistBuddy \
+              -c "Print :CFBundleIdentifier" \
+              /tmp/sidestore-info.plist
+
+            /usr/libexec/PlistBuddy \
+              -c "Print :CFBundleShortVersionString" \
+              /tmp/sidestore-info.plist
+
+            /usr/libexec/PlistBuddy \
+              -c "Print :CFBundleVersion" \
+              /tmp/sidestore-info.plist
+
+            echo
+            echo "SHA256:"
+            shasum -a 256 "LiveContainer.ipa"
+            shasum -a 256 "LiveContainer+SideStore.ipa"
+          } > build-info.txt
+
+          cat build-info.txt
+
+      - name: Upload LiveContainer IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: LiveContainer
+          path: LiveContainer.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload LiveContainer + SideStore IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: LiveContainer-plus-SideStore
+          path: LiveContainer+SideStore.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build information
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-info
+          path: build-info.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Job summary
+        shell: bash
+        run: |
+          {
+            echo "## LiveContainer + Official SideStore Nightly"
+            echo
+            echo "### LiveContainer"
+            echo '```'
+            git log -1 --oneline
+            echo '```'
+            echo
+            echo "### SideStore"
+            echo '```'
+            cat build-info.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
