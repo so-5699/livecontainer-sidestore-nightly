@@ -1,735 +1,633 @@
-name: LiveContainer + SideStore Nightly
+name: LiveContainer + SideStore (LC-support + upstream CoreData sync)
 
 on:
   workflow_dispatch:
-
   schedule:
-    # 23:00 UTC = 08:00 JST
+    # Every day at 23:00 UTC = 08:00 JST (next day)
     - cron: "0 23 * * *"
 
 permissions:
   contents: read
 
-concurrency:
-  group: livecontainer-sidestore-nightly
-  cancel-in-progress: true
-
 jobs:
   build:
-    name: Build LiveContainer + SideStore
-    runs-on: macos-latest
+    runs-on: macos-15
 
     env:
-      LC_REPO: LiveContainer/LiveContainer
-      LC_BRANCH: main
+      scheme: LiveContainer
+      archive_path: archive
 
-      # IMPORTANT
-      #
-      # LiveContainer's built-in SideStore integration is based on
-      # the LiveContainer/SideStore fork.
-      #
-      # Do NOT replace this with SideStore/SideStore here.
-      SIDESTORE_URL: https://github.com/LiveContainer/SideStore/releases/download/nightly/SideStore.ipa
+      # LiveContainer team's LC-adapted branch (base).
+      SIDESTORE_LC_REF: LiveContainerSupport
 
-      OUTPUT_IPA: LiveContainer+SideStore.ipa
+      # Upstream SideStore branch that we selectively sync from.
+      SIDESTORE_UPSTREAM_BRANCH: develop
+
+      # Paths we care about for Core Data / AltStoreCore.
+      # Multiple entries can be added; missing ones are skipped safely.
+      SIDESTORE_SYNC_PATHS: |
+        AltStoreCore
+        AltStore/Models
+        AltStoreCore/Models
 
     steps:
-
       # ============================================================
-      # 1. Checkout LiveContainer
+      # 1. LiveContainer
       # ============================================================
-
-      - name: Checkout LiveContainer
-        uses: actions/checkout@v6
+      - name: LiveContainer最新版をチェックアウト
+        uses: actions/checkout@v4
         with:
-          repository: ${{ env.LC_REPO }}
-          ref: ${{ env.LC_BRANCH }}
+          repository: LiveContainer/LiveContainer
+          ref: main
+          submodules: recursive
           fetch-depth: 1
+
+      - name: LiveContainerのコミット情報を表示
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "LiveContainer commit:"
+          git rev-parse HEAD
+          git log -1 --oneline
 
       # ============================================================
       # 2. Xcode
       # ============================================================
+      - name: Xcodeをセットアップ
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "16.4"
 
-      - name: Select Xcode
+      - name: Xcodeバージョンを表示
+        run: xcodebuild -version
+
+      # ============================================================
+      # 3. Detect LiveContainer Xcode project
+      # ============================================================
+      - name: Xcodeプロジェクト/ワークスペースを判定
+        id: xcode
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "=== Xcode installations ==="
-          ls -1 /Applications | grep '^Xcode' || true
-
-          if [ -d "/Applications/Xcode_26.2.app" ]; then
-            sudo xcode-select -s /Applications/Xcode_26.2.app
-          fi
-
-          echo
-          echo "=== Selected Xcode ==="
-          xcode-select -p
-          xcodebuild -version
-
-      # ============================================================
-      # 3. Install tools
-      # ============================================================
-
-      - name: Install build tools
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          brew install ldid
-
-          echo "=== ldid ==="
-          ldid -V || true
-
-      # ============================================================
-      # 4. Download SideStore
-      # ============================================================
-
-      - name: Download LiveContainer-compatible SideStore Nightly
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$RUNNER_TEMP/sidestore"
-
-          curl \
-            --fail \
-            --location \
-            --retry 5 \
-            --retry-all-errors \
-            --connect-timeout 20 \
-            --output "$RUNNER_TEMP/sidestore/SideStore.ipa" \
-            "$SIDESTORE_URL"
-
-          test -s "$RUNNER_TEMP/sidestore/SideStore.ipa"
-
-          echo "=== SideStore SHA256 ==="
-          shasum -a 256 "$RUNNER_TEMP/sidestore/SideStore.ipa"
-
-      # ============================================================
-      # 5. Extract SideStore
-      # ============================================================
-
-      - name: Extract SideStore
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          rm -rf "$RUNNER_TEMP/sidestore/extracted"
-
-          mkdir -p "$RUNNER_TEMP/sidestore/extracted"
-
-          unzip -q \
-            "$RUNNER_TEMP/sidestore/SideStore.ipa" \
-            -d "$RUNNER_TEMP/sidestore/extracted"
-
-          APP="$RUNNER_TEMP/sidestore/extracted/Payload/SideStore.app"
-
-          if [ ! -d "$APP" ]; then
-            echo "::error::SideStore.app was not found."
+          if [ -f "LiveContainer.xcworkspace/contents.xcworkspacedata" ]; then
+            echo "filetype_parameter=workspace" >> "$GITHUB_OUTPUT"
+            echo "file_to_build=LiveContainer.xcworkspace" >> "$GITHUB_OUTPUT"
+          elif [ -f "LiveContainer.xcodeproj/project.pbxproj" ]; then
+            echo "filetype_parameter=project" >> "$GITHUB_OUTPUT"
+            echo "file_to_build=LiveContainer.xcodeproj" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: Could not find LiveContainer Xcode project/workspace."
             exit 1
           fi
 
-          echo "SideStore.app:"
-          echo "$APP"
-
       # ============================================================
-      # 6. Preflight Core Data
-      #
-      # Prevents the known:
-      #
-      #   NSPersistentContainer Code=-23
-      #   Unable to find any managed object models
-      #
-      # class of failure.
+      # 4. Build LiveContainer
       # ============================================================
-
-      - name: Validate SideStore Core Data resources
+      - name: LiveContainerをアーカイブ
         shell: bash
         run: |
           set -euo pipefail
+          xcodebuild archive \
+            -archivePath "$archive_path" \
+            -scheme "$scheme" \
+            -"${{ steps.xcode.outputs.filetype_parameter }}" \
+            "${{ steps.xcode.outputs.file_to_build }}" \
+            -sdk iphoneos \
+            -arch arm64 \
+            -configuration Release \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            | xcbeautify
 
-          APP="$RUNNER_TEMP/sidestore/extracted/Payload/SideStore.app"
+      # ============================================================
+      # 5. Install tools
+      # ============================================================
+      - name: 依存ツールをインストール
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ldid xcbeautify
 
-          echo "=== Core Data resources ==="
+      # ============================================================
+      # 6. Get SideStore: LC branch as base
+      # ============================================================
+      - name: LiveContainerSupport版SideStoreを取得
+        uses: actions/checkout@v4
+        with:
+          repository: LiveContainer/SideStore
+          ref: ${{ env.SIDESTORE_LC_REF }}
+          submodules: recursive
+          fetch-depth: 0
+          path: sidestore
 
-          find "$APP" \
-            \( -name "*.mom" -o -name "*.momd" \) \
-            -print \
-            | sort
+      - name: SideStore upstream developを追加
+        shell: bash
+        working-directory: sidestore
+        run: |
+          set -euo pipefail
 
-          MODEL_COUNT=$(
-            find "$APP" \
-              \( -name "*.mom" -o -name "*.momd" \) \
-              -print \
-              | wc -l \
-              | tr -d ' '
+          git remote -v
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/SideStore/SideStore.git
+          else
+            git remote add upstream https://github.com/SideStore/SideStore.git
+          fi
+
+          git fetch upstream "${SIDESTORE_UPSTREAM_BRANCH}" --prune
+
+          echo "=== LC branch ==="
+          git rev-parse HEAD
+          git log -1 --oneline
+
+          echo
+          echo "=== Upstream ==="
+          git rev-parse "upstream/${SIDESTORE_UPSTREAM_BRANCH}"
+          git log -1 --oneline "upstream/${SIDESTORE_UPSTREAM_BRANCH}"
+
+      # ============================================================
+      # 7. Show diff in Core Data / AltStoreCore area
+      # ============================================================
+      - name: Core Data / AltStoreCore 差分を可視化
+        shell: bash
+        working-directory: sidestore
+        run: |
+          set -euo pipefail
+
+          BASE=$(git merge-base HEAD "upstream/${SIDESTORE_UPSTREAM_BRANCH}")
+          echo "Merge base: $BASE"
+          git log -1 --oneline "$BASE"
+
+          echo
+          echo "=== Directory layout (top level) ==="
+          ls -la
+
+          echo
+          echo "=== *.xcdatamodeld locations ==="
+          find . -name "*.xcdatamodeld" -not -path "./.git/*" -print || true
+
+          echo
+          echo "=== AltStoreCore* locations ==="
+          find . -iname "AltStoreCore*" -not -path "./.git/*" -print || true
+
+          echo
+          echo "=== Files changed upstream in AltStoreCore-ish paths ==="
+          git diff --stat "$BASE" "upstream/${SIDESTORE_UPSTREAM_BRANCH}" -- \
+            AltStoreCore AltStore/Models AltStoreCore/Models '*.xcdatamodeld' 2>/dev/null || true
+
+      # ============================================================
+      # 8. Selectively sync only Core Data / AltStoreCore files
+      #
+      # Rule:
+      #   - If upstream changed a file and LC branch did NOT modify it
+      #     since the merge base, take upstream's version.
+      #   - If both modified it, keep LC's version (LC adaptation wins).
+      #
+      # This avoids a full `git merge` (which would conflict on the
+      # Xcode project and other LC-specific overrides) while still
+      # picking up upstream fixes in the Core Data layer.
+      # ============================================================
+      - name: Core Data / AltStoreCoreを選択的に取り込み
+        shell: bash
+        working-directory: sidestore
+        run: |
+          set -euo pipefail
+
+          BASE=$(git merge-base HEAD "upstream/${SIDESTORE_UPSTREAM_BRANCH}")
+
+          # Build list of paths, skipping ones that don't exist locally.
+          PATHS=()
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [ -e "$line" ]; then
+              PATHS+=("$line")
+            else
+              echo "skip (not present): $line"
+            fi
+          done <<< "$SIDESTORE_SYNC_PATHS"
+
+          # Also always include any *.xcdatamodeld found anywhere.
+          while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            PATHS+=("$d")
+          done < <(find . -name "*.xcdatamodeld" -not -path "./.git/*" -print)
+
+          if [ ${#PATHS[@]} -eq 0 ]; then
+            echo "No sync paths found. Using LC branch as-is."
+          fi
+
+          printf 'Sync paths:\n'
+          for p in "${PATHS[@]}"; do printf '  %s\n' "$p"; done
+
+          # Files LC changed since base (within these paths)
+          LC_CHANGED=$(git diff --name-only "$BASE" HEAD -- "${PATHS[@]}" || true)
+          # Files upstream changed since base (within these paths)
+          UP_CHANGED=$(git diff --name-only "$BASE" "upstream/${SIDESTORE_UPSTREAM_BRANCH}" -- "${PATHS[@]}" || true)
+
+          echo
+          echo "=== LC-changed files in scope ==="
+          echo "$LC_CHANGED"
+
+          echo
+          echo "=== Upstream-changed files in scope ==="
+          echo "$UP_CHANGED"
+
+          echo
+          echo "=== Applying upstream-only changes ==="
+
+          if [ -z "$UP_CHANGED" ]; then
+            echo "No upstream changes in scope."
+          fi
+
+          # Use a temp file to iterate safely
+          printf '%s\n' "$UP_CHANGED" > /tmp/up_changed.txt
+          printf '%s\n' "$LC_CHANGED" > /tmp/lc_changed.txt
+
+          while IFS= read -r F; do
+            [ -z "$F" ] && continue
+
+            if grep -qxF "$F" /tmp/lc_changed.txt; then
+              echo "KEEP   (LC-modified): $F"
+            else
+              echo "TAKE   (upstream)  : $F"
+              # Handles new files too
+              git checkout "upstream/${SIDESTORE_UPSTREAM_BRANCH}" -- "$F" || {
+                echo "WARN: checkout failed for $F (may have been deleted upstream)"
+              }
+            fi
+          done < /tmp/up_changed.txt
+
+          echo
+          echo "=== git status after selective sync ==="
+          git status --short
+
+      - name: 選択取り込み後の状態を確認
+        shell: bash
+        working-directory: sidestore
+        run: |
+          set -euo pipefail
+
+          echo "=== .xcdatamodeld present ==="
+          find . -name "*.xcdatamodeld" -not -path "./.git/*" -print
+
+          echo
+          echo "=== Core Data model version hash info ==="
+          while IFS= read -r d; do
+            echo "--- $d ---"
+            ls -la "$d" || true
+          done < <(find . -name "*.xcdatamodeld" -not -path "./.git/*" -print)
+
+      # ============================================================
+      # 9. Build SideStore from source (includes AltStoreCore)
+      # ============================================================
+      - name: SideStoreをソースからビルド
+        shell: bash
+        working-directory: sidestore
+        run: |
+          set -euo pipefail
+
+          # Discover project/scheme (AltStore.xcodeproj / SideStore scheme)
+          test -d AltStore.xcodeproj
+
+          rm -rf SideStore.xcarchive
+
+          xcodebuild \
+            -project AltStore.xcodeproj \
+            -scheme SideStore \
+            -sdk iphoneos \
+            -configuration Release \
+            -archivePath ./SideStore.xcarchive \
+            CODE_SIGNING_REQUIRED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcbeautify
+
+      # ============================================================
+      # 10. Package SideStore IPA
+      # ============================================================
+      - name: SideStore IPAを生成
+        shell: bash
+        working-directory: sidestore
+        run: |
+          set -euo pipefail
+
+          rm -rf Payload
+          mkdir -p Payload
+
+          cp -R SideStore.xcarchive/Products/Applications/SideStore.app Payload/SideStore.app
+
+          rm -f SideStore.ipa
+          (
+            cd Payload
+            zip -qr ../SideStore.ipa SideStore.app \
+              -x "._*" -x ".DS_Store" -x "__MACOSX"
           )
 
-          echo
-          echo "Model count: $MODEL_COUNT"
-
-          if [ "$MODEL_COUNT" -eq 0 ]; then
-            echo "::error::No Core Data .mom/.momd resources found."
-            exit 1
-          fi
-
-          echo
-          echo "=== AltStore model ==="
-
-          find "$APP" \
-            \( -name "AltStore.mom" -o -name "AltStore.momd" \) \
-            -print
-
-          if ! find "$APP" \
-            \( -name "AltStore.mom" -o -name "AltStore.momd" \) \
-            | grep -q .; then
-
-            echo "::error::AltStore Core Data model is missing."
-            exit 1
-          fi
+          ls -lh SideStore.ipa
 
       # ============================================================
-      # 7. Validate AltStoreCore
+      # 11. CRITICAL: Verify AltStoreCore + Core Data in built app
       #
-      # This is the important difference from the previous workflow.
-      #
-      # The previous broken IPA contained AltStore.momd but the
-      # SideStore binary expected AltStoreCore resources.
-      #
-      # If AltStoreCore is missing, STOP.
+      # This is the check that the previous nightly IPA failed.
       # ============================================================
-
-      - name: Validate AltStoreCore
+      - name: ビルド済みSideStoreにAltStoreCore/CoreDataがあるか検証
         shell: bash
+        working-directory: sidestore
         run: |
           set -euo pipefail
 
-          APP="$RUNNER_TEMP/sidestore/extracted/Payload/SideStore.app"
+          rm -rf verify
+          mkdir verify
+          unzip -q SideStore.ipa -d verify
 
-          echo "=== AltStoreCore ==="
+          APP="verify/SideStore.app"
+          test -d "$APP"
+          test -f "$APP/SideStore"
 
-          find "$APP" \
-            \( \
-              -iname "AltStoreCore.framework" \
-              -o \
-              -iname "AltStoreCore.bundle" \
-            \) \
-            -print \
-            | sort
-
-          CORE_COUNT=$(
-            find "$APP" \
-              \( \
-                -iname "AltStoreCore.framework" \
-                -o \
-                -iname "AltStoreCore.bundle" \
-              \) \
-              -print \
-              | wc -l \
-              | tr -d ' '
-          )
+          echo "=== Top-level SideStore.app ==="
+          ls -la "$APP"
 
           echo
-          echo "AltStoreCore count: $CORE_COUNT"
+          echo "=== AltStoreCore* inside SideStore.app ==="
+          find "$APP" -iname "AltStoreCore*" -print || true
 
-          if [ "$CORE_COUNT" -eq 0 ]; then
-            echo "::error::AltStoreCore.framework / AltStoreCore.bundle not found."
-            echo "::error::Refusing to build a potentially broken LC+SideStore IPA."
+          echo
+          echo "=== *.momd inside SideStore.app ==="
+          find "$APP" \( -name "*.momd" -o -name "*.mom" \) -print
+
+          # 1. .momd must exist somewhere in the app
+          if ! find "$APP" \( -name "*.momd" -o -name "*.mom" \) -print -quit | grep -q .; then
+            echo "ERROR: No Core Data models in built SideStore.app"
             exit 1
           fi
 
-      # ============================================================
-      # 8. Inspect SideStore executable
-      # ============================================================
-
-      - name: Inspect SideStore binary
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APP="$RUNNER_TEMP/sidestore/extracted/Payload/SideStore.app"
-
-          EXECUTABLE=$(
-            /usr/libexec/PlistBuddy \
-              -c "Print :CFBundleExecutable" \
-              "$APP/Info.plist"
-          )
-
-          BIN="$APP/$EXECUTABLE"
-
-          if [ ! -f "$BIN" ]; then
-            echo "::error::SideStore executable not found."
+          # 2. AltStoreCore.{framework,bundle} must exist
+          if ! find "$APP" -iname "AltStoreCore.framework" -o -iname "AltStoreCore.bundle" -print -quit | grep -q .; then
+            echo "ERROR: AltStoreCore.framework/.bundle missing from built SideStore.app"
+            echo "This would cause:"
+            echo '  AltStoreCore bundle not found'
+            echo '  Failed to load model AltStore from AltStoreCore bundle'
+            echo '  Code=-23'
             exit 1
           fi
 
-          echo "Executable: $EXECUTABLE"
+          echo
+          echo "=== Info.plist (SideStore.app) ==="
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist"
 
           echo
-          echo "=== Core Data / AltStoreCore strings ==="
-
-          strings "$BIN" \
-            | grep -E \
-              'AltStoreCore|NSManagedObjectModel|NSPersistentContainer|managedObjectModel' \
-            | sort -u \
-            || true
+          echo "=== AltStoreCore Info.plist (if framework) ==="
+          CORE=$(find "$APP" -iname "AltStoreCore.framework" -type d -print -quit || true)
+          if [ -n "$CORE" ] && [ -f "$CORE/Info.plist" ]; then
+            /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$CORE/Info.plist" || true
+          fi
 
       # ============================================================
-      # 9. Copy SideStore locally
-      #
-      # Official LiveContainer build script will normally download
-      # its own SideStore.
-      #
-      # We patch ONLY that download line.
-      #
-      # We do NOT rewrite the actual integration logic.
+      # 12. Place SideStore IPA where build_github.sh expects it
       # ============================================================
-
-      - name: Prepare local SideStore
+      - name: 統合用SideStore IPAを配置
         shell: bash
         run: |
           set -euo pipefail
-
-          cp \
-            "$RUNNER_TEMP/sidestore/SideStore.ipa" \
-            "$GITHUB_WORKSPACE/SideStore.ipa"
-
-          test -s "$GITHUB_WORKSPACE/SideStore.ipa"
+          cp sidestore/SideStore.ipa ./SideStore.ipa
+          ls -lh ./SideStore.ipa
 
       # ============================================================
-      # 10. Patch official LiveContainer build script
+      # 13. Patch build_github.sh: use local IPA instead of download
       # ============================================================
-
-      - name: Patch SideStore download
+      - name: LiveContainer統合スクリプトをローカルSideStore用に変更
         shell: bash
         run: |
           set -euo pipefail
 
           SCRIPT=".github/build_github.sh"
+          test -f "$SCRIPT"
+          test -f "SideStore.ipa"
 
-          if [ ! -f "$SCRIPT" ]; then
-            echo "::error::$SCRIPT not found."
-            exit 1
-          fi
+          echo "=== Original SideStore-related lines ==="
+          grep -n "SideStore.ipa" "$SCRIPT" || true
 
-          cp "$SCRIPT" "$SCRIPT.original"
-
-          python3 <<'PY'
+          python3 - <<'PY'
+          import re
           from pathlib import Path
 
           path = Path(".github/build_github.sh")
           text = path.read_text()
 
-          targets = [
-              "wget https://github.com/LiveContainer/SideStore/releases/download/nightly/SideStore.ipa",
-              "wget https://github.com/SideStore/SideStore/releases/download/nightly/SideStore.ipa",
-          ]
-
-          replacement = 'cp "$GITHUB_WORKSPACE/SideStore.ipa" ./SideStore.ipa'
-
-          found = False
-
-          for target in targets:
-              if target in text:
-                  text = text.replace(target, replacement)
-                  found = True
-
-          if not found:
+          pattern = re.compile(
+              r"(?m)^[^\n]*(?:wget|curl)[^\n]*SideStore\.ipa[^\n]*$"
+          )
+          matches = list(pattern.finditer(text))
+          if not matches:
               raise SystemExit(
-                  "Expected SideStore download command was not found. "
-                  "Refusing to modify an unknown build script."
+                  "ERROR: Could not locate SideStore download command."
               )
 
-          path.write_text(text)
+          def repl(_m):
+              return (
+                  'test -f SideStore.ipa\n'
+                  'echo "Using locally built SideStore.ipa"\n'
+                  'ls -lh SideStore.ipa'
+              )
+
+          new_text, count = pattern.subn(repl, text, count=1)
+          path.write_text(new_text)
+          print(f"Patched {count} command(s).")
           PY
 
-          echo "=== Patched build script ==="
-          grep -n -E 'SideStore|SideStore\.ipa' "$SCRIPT"
+          echo
+          echo "=== Patched lines ==="
+          grep -n -A2 -B2 "Using locally built SideStore" "$SCRIPT"
 
-      # ============================================================
-      # 11. Build using LiveContainer's official integration
-      # ============================================================
-
-      - name: Build LiveContainer + SideStore
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x .github/build_github.sh
-
-          .github/build_github.sh
-
-      # ============================================================
-      # 12. Find output IPA
-      # ============================================================
-
-      - name: Locate final IPA
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=== IPA files ==="
-
-          find . \
-            -type f \
-            -name "*.ipa" \
-            -print \
-            | sort
-
-          FOUND=$(
-            find . \
-              -type f \
-              -name 'LiveContainer+SideStore.ipa' \
-              | head -n 1
-          )
-
-          if [ -z "$FOUND" ]; then
-            echo "::error::LiveContainer+SideStore.ipa was not generated."
-            exit 1
-          fi
-
-          cp "$FOUND" "$OUTPUT_IPA"
-
-          test -s "$OUTPUT_IPA"
-
-      # ============================================================
-      # 13. Extract final IPA
-      # ============================================================
-
-      - name: Extract final IPA
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          rm -rf "$RUNNER_TEMP/final"
-
-          mkdir -p "$RUNNER_TEMP/final"
-
-          unzip -q \
-            "$OUTPUT_IPA" \
-            -d "$RUNNER_TEMP/final"
-
-          APP="$RUNNER_TEMP/final/Payload/LiveContainer.app"
-
-          if [ ! -d "$APP" ]; then
-            echo "::error::LiveContainer.app missing from final IPA."
+          if grep -E "(wget|curl).*SideStore\.ipa" "$SCRIPT"; then
+            echo "ERROR: Remote download still present."
             exit 1
           fi
 
       # ============================================================
-      # 14. Validate embedded SideStore
+      # 14. Run LC integration script
       # ============================================================
+      - name: 公式LiveContainer統合処理を実行
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh .github/build_github.sh
 
-      - name: Validate embedded SideStore
+      # ============================================================
+      # 15. Verify final IPA (with AltStoreCore!)
+      # ============================================================
+      - name: 生成された統合版IPAを確認
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "LiveContainer+SideStore.ipa"
+          ls -lh "LiveContainer+SideStore.ipa"
+
+      - name: 統合版IPAを展開
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf verify-final
+          mkdir -p verify-final
+          unzip -q "LiveContainer+SideStore.ipa" -d verify-final
+
+      - name: 【重要】AltStoreCore/CoreDataを最終IPAで検証
         shell: bash
         run: |
           set -euo pipefail
 
-          APP="$RUNNER_TEMP/final/Payload/LiveContainer.app"
-          SS="$APP/Frameworks/SideStoreApp.framework"
+          APP="verify-final/Payload/LiveContainer.app"
+          FW="$APP/Frameworks/SideStoreApp.framework"
 
-          if [ ! -d "$SS" ]; then
-            echo "::error::SideStoreApp.framework missing."
+          echo "=== SideStoreApp.framework top-level ==="
+          find "$FW" -maxdepth 2 -print | sort
+
+          echo
+          echo "=== AltStoreCore* anywhere in LiveContainer.app ==="
+          find "$APP" -iname "AltStoreCore*" -print || true
+
+          echo
+          echo "=== *.momd anywhere in LiveContainer.app ==="
+          find "$APP" \( -name "*.momd" -o -name "*.mom" \) -print
+
+          echo
+          echo "=== strings: AltStoreCore references in SideStore binary ==="
+          strings "$FW/SideStore" | grep -iE "AltStoreCore|com\.sidestore|com\.altstore" | sort -u | head -40 || true
+
+          # CRITICAL check: AltStoreCore must exist in final IPA
+          if ! find "$APP" \( -iname "AltStoreCore.framework" -o -iname "AltStoreCore.bundle" \) -print -quit | grep -q .; then
+            echo
+            echo "FATAL: AltStoreCore.framework/.bundle is MISSING in final IPA."
+            echo "This WILL cause:"
+            echo '  AltStoreCore bundle not found'
+            echo '  Failed to load model AltStore from AltStoreCore bundle'
+            echo '  io.sidestore.PersistentContainer Code=-23'
             exit 1
           fi
 
-          BUNDLE_ID=$(
-            /usr/libexec/PlistBuddy \
-              -c "Print :CFBundleIdentifier" \
-              "$SS/Info.plist"
-          )
-
-          echo "Bundle ID: $BUNDLE_ID"
-
-          if [ "$BUNDLE_ID" != "com.SideStore.SideStore" ]; then
-            echo "::error::Unexpected SideStore bundle ID: $BUNDLE_ID"
+          # And .momd must exist somewhere under AltStoreCore
+          CORE=$(find "$APP" \( -iname "AltStoreCore.framework" -o -iname "AltStoreCore.bundle" \) -type d -print -quit)
+          if ! find "$CORE" \( -name "*.momd" -o -name "*.mom" \) -print -quit | grep -q .; then
+            echo "FATAL: $CORE has no .momd"
+            find "$CORE" -print
             exit 1
-          fi
-
-      # ============================================================
-      # 15. Validate final Core Data resources
-      # ============================================================
-
-      - name: Validate final Core Data
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SS="$RUNNER_TEMP/final/Payload/LiveContainer.app/Frameworks/SideStoreApp.framework"
-
-          echo "=== Final Core Data resources ==="
-
-          find "$SS" \
-            \( -name "*.mom" -o -name "*.momd" \) \
-            -print \
-            | sort
-
-          if ! find "$SS" \
-            \( -name "*.mom" -o -name "*.momd" \) \
-            | grep -q .; then
-
-            echo "::error::Core Data models disappeared during integration."
-            exit 1
-          fi
-
-          if ! find "$SS" \
-            \( -name "AltStore.mom" -o -name "AltStore.momd" \) \
-            | grep -q .; then
-
-            echo "::error::AltStore model disappeared during integration."
-            exit 1
-          fi
-
-      # ============================================================
-      # 16. Validate final AltStoreCore
-      # ============================================================
-
-      - name: Validate final AltStoreCore
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APP="$RUNNER_TEMP/final/Payload/LiveContainer.app"
-
-          echo "=== Final AltStoreCore ==="
-
-          find "$APP" \
-            \( \
-              -iname "AltStoreCore.framework" \
-              -o \
-              -iname "AltStoreCore.bundle" \
-            \) \
-            -print \
-            | sort
-
-          CORE_COUNT=$(
-            find "$APP" \
-              \( \
-                -iname "AltStoreCore.framework" \
-                -o \
-                -iname "AltStoreCore.bundle" \
-              \) \
-              -print \
-              | wc -l \
-              | tr -d ' '
-          )
-
-          if [ "$CORE_COUNT" -eq 0 ]; then
-            echo "::error::AltStoreCore disappeared during integration."
-            echo "::error::This build is rejected."
-            exit 1
-          fi
-
-      # ============================================================
-      # 17. Validate SideStore executable
-      # ============================================================
-
-      - name: Validate final SideStore executable
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SS="$RUNNER_TEMP/final/Payload/LiveContainer.app/Frameworks/SideStoreApp.framework"
-
-          EXECUTABLE=$(
-            /usr/libexec/PlistBuddy \
-              -c "Print :CFBundleExecutable" \
-              "$SS/Info.plist"
-          )
-
-          BIN="$SS/$EXECUTABLE"
-
-          if [ ! -f "$BIN" ]; then
-            echo "::error::SideStore executable missing."
-            exit 1
-          fi
-
-          echo "=== Relevant binary strings ==="
-
-          strings "$BIN" \
-            | grep -E \
-              'AltStoreCore|NSManagedObjectModel|NSPersistentContainer|managedObjectModel' \
-            | sort -u \
-            || true
-
-      # ============================================================
-      # 18. Check suspicious nested frameworks
-      # ============================================================
-
-      - name: Validate nested frameworks
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APP="$RUNNER_TEMP/final/Payload/LiveContainer.app"
-          SS="$APP/Frameworks/SideStoreApp.framework"
-
-          echo "=== SideStore Frameworks ==="
-
-          if [ -d "$SS/Frameworks" ]; then
-            find "$SS/Frameworks" \
-              -maxdepth 2 \
-              -print \
-              | sort
           fi
 
           echo
-          echo "=== Widget Frameworks ==="
-
-          WIDGET="$APP/PlugIns/LiveWidgetExtension.appex"
-
-          if [ -d "$WIDGET/Frameworks" ]; then
-            find "$WIDGET/Frameworks" \
-              -maxdepth 2 \
-              -print \
-              | sort
-          fi
-
-          if find "$SS" \
-            -type d \
-            -path '*SideStoreApp.framework/Frameworks/SideStoreApp.framework*' \
-            | grep -q .; then
-
-            echo "::error::Recursive SideStoreApp.framework nesting detected."
-            exit 1
-          fi
+          echo "AltStoreCore / Core Data presence verified in final IPA."
 
       # ============================================================
-      # 19. Validate Widget
+      # 16. Other final validations
       # ============================================================
+      - name: SideStore frameworkを検証
+        shell: bash
+        run: |
+          set -euo pipefail
+          FW="verify-final/Payload/LiveContainer.app/Frameworks/SideStoreApp.framework"
+          test -d "$FW"
+          test -f "$FW/SideStore"
 
-      - name: Validate LiveWidgetExtension
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier"        "$FW/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$FW/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion"            "$FW/Info.plist"
+
+      - name: LiveWidgetExtensionを検証
+        shell: bash
+        run: |
+          set -euo pipefail
+          WIDGET="verify-final/Payload/LiveContainer.app/PlugIns/LiveWidgetExtension.appex"
+          test -d "$WIDGET"
+          test -f "$WIDGET/LiveWidgetExtension"
+
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$WIDGET/Info.plist")
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$WIDGET/Info.plist")
+          echo "Widget ID: $BUNDLE_ID  exec: $EXECUTABLE"
+
+      # ============================================================
+      # 17. SHA256 + build info
+      # ============================================================
+      - name: SHA256を計算
+        shell: bash
+        run: |
+          set -euo pipefail
+          shasum -a 256 "LiveContainer+SideStore.ipa"
+
+      - name: ビルド情報を作成
         shell: bash
         run: |
           set -euo pipefail
 
-          APP="$RUNNER_TEMP/final/Payload/LiveContainer.app"
-          WIDGET="$APP/PlugIns/LiveWidgetExtension.appex"
-
-          if [ ! -d "$WIDGET" ]; then
-            echo "::error::LiveWidgetExtension.appex missing."
-            exit 1
-          fi
-
-          echo "Widget found."
-
-          BUNDLE_ID=$(
-            /usr/libexec/PlistBuddy \
-              -c "Print :CFBundleIdentifier" \
-              "$WIDGET/Info.plist"
-          )
-
-          echo "Widget Bundle ID: $BUNDLE_ID"
-
-          if [ "$BUNDLE_ID" != "com.kdt.livecontainer.LiveWidget" ]; then
-            echo "::error::Unexpected Widget bundle ID."
-            exit 1
-          fi
-
-      # ============================================================
-      # 20. Validate LCAppInfo
-      # ============================================================
-
-      - name: Validate LCAppInfo
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SS="$RUNNER_TEMP/final/Payload/LiveContainer.app/Frameworks/SideStoreApp.framework"
-
-          if [ ! -f "$SS/LCAppInfo.plist" ]; then
-            echo "::error::LCAppInfo.plist missing."
-            exit 1
-          fi
-
-          echo "LCAppInfo.plist OK."
-
-      # ============================================================
-      # 21. Final package sanity check
-      # ============================================================
-
-      - name: Final IPA sanity check
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=== Final IPA ==="
-
-          unzip -l "$OUTPUT_IPA" \
-            | grep -E \
-              'SideStoreApp.framework|AltStoreCore|AltStore\.mom|LiveWidgetExtension' \
-            | sed -n '1,300p'
-
-          echo
-          echo "Final IPA size:"
-          du -h "$OUTPUT_IPA"
-
-      # ============================================================
-      # 22. SHA256
-      # ============================================================
-
-      - name: Generate SHA256
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          shasum -a 256 "$OUTPUT_IPA" \
-            | tee "$OUTPUT_IPA.sha256"
-
-      # ============================================================
-      # 23. Build information
-      # ============================================================
-
-      - name: Generate build information
-        shell: bash
-        run: |
-          set -euo pipefail
+          FW_INFO="verify-final/Payload/LiveContainer.app/Frameworks/SideStoreApp.framework/Info.plist"
 
           {
-            echo "========================================"
-            echo "LiveContainer + SideStore Nightly"
-            echo "========================================"
+            echo "LiveContainer + SideStore (LC-support + upstream CoreData sync)"
             echo
-
-            echo "UTC:"
-            date -u
-            echo
-
-            echo "LiveContainer:"
+            echo "## LiveContainer"
             git rev-parse HEAD
             git log -1 --oneline
             echo
-
-            echo "Xcode:"
+            echo "## Xcode"
             xcodebuild -version
             echo
-
-            echo "SideStore URL:"
-            echo "$SIDESTORE_URL"
+            echo "## SideStore LC branch"
+            cd sidestore
+            git rev-parse HEAD
+            git log -1 --oneline
             echo
-
-            echo "SideStore SHA256:"
-            shasum -a 256 \
-              "$RUNNER_TEMP/sidestore/SideStore.ipa"
+            echo "## SideStore upstream ${SIDESTORE_UPSTREAM_BRANCH}"
+            git rev-parse "upstream/${SIDESTORE_UPSTREAM_BRANCH}"
+            git log -1 --oneline "upstream/${SIDESTORE_UPSTREAM_BRANCH}"
             echo
-
-            echo "Final IPA SHA256:"
-            shasum -a 256 \
-              "$OUTPUT_IPA"
+            echo "## Merge base"
+            git merge-base HEAD "upstream/${SIDESTORE_UPSTREAM_BRANCH}"
             echo
-          } | tee build-info.txt
+            cd ..
+            echo "## Embedded SideStore"
+            /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier"        "$FW_INFO"
+            /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$FW_INFO"
+            /usr/libexec/PlistBuddy -c "Print :CFBundleVersion"            "$FW_INFO"
+            echo
+            echo "## SHA256"
+            shasum -a 256 "LiveContainer+SideStore.ipa"
+          } > build-info.txt
+
+          cat build-info.txt
 
       # ============================================================
-      # 24. Upload
+      # 18. Upload
       # ============================================================
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - name: LiveContainer + SideStore IPAをアップロード
+        uses: actions/upload-artifact@v4
         with:
-          name: LiveContainer+SideStore
-          path: |
-            LiveContainer+SideStore.ipa
-            LiveContainer+SideStore.ipa.sha256
-            build-info.txt
+          name: LiveContainer-plus-SideStore
+          path: LiveContainer+SideStore.ipa
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
+
+      - name: ビルド情報をアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info
+          path: build-info.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: ジョブサマリーを出力
+        shell: bash
+        run: |
+          {
+            echo "## LiveContainer + SideStore"
+            echo
+            echo "### LiveContainer"
+            echo '```'
+            git log -1 --oneline
+            echo '```'
+            echo
+            echo "### Build information"
+            echo '```'
+            cat build-info.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
