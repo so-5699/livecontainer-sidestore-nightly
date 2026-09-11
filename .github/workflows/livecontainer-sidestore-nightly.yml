@@ -1,4 +1,4 @@
-name: Build LiveContainer + Official SideStore Nightly
+name: LiveContainer + 公式SideStore Nightlyビルド
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
       archive_path: archive
 
     steps:
-      - name: Checkout latest LiveContainer
+      - name: LiveContainer最新版をチェックアウト
         uses: actions/checkout@v6
         with:
           repository: LiveContainer/LiveContainer
@@ -27,23 +27,23 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Show LiveContainer revision
+      - name: LiveContainerのコミット情報を表示
         shell: bash
         run: |
           echo "LiveContainer commit:"
           git rev-parse HEAD
           git log -1 --oneline
 
-      - name: Setup Xcode
+      - name: Xcodeをセットアップ
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: "26.2"
 
-      - name: Show Xcode version
+      - name: Xcodeバージョンを表示
         run: |
           xcodebuild -version
 
-      - name: Determine Xcode project/workspace
+      - name: Xcodeプロジェクト/ワークスペースを判定
         id: xcode
         shell: bash
         run: |
@@ -58,7 +58,7 @@ jobs:
             exit 1
           fi
 
-      - name: Archive LiveContainer
+      - name: LiveContainerをアーカイブ
         shell: bash
         run: |
           xcodebuild archive \
@@ -71,12 +71,12 @@ jobs:
             -configuration Release \
             | xcpretty && exit ${PIPESTATUS[0]}
 
-      - name: Install ldid
+      - name: ldidをインストール
         shell: bash
         run: |
           brew install ldid
 
-      - name: Download dylibify
+      - name: dylibifyをダウンロード
         shell: bash
         run: |
           curl -L \
@@ -84,7 +84,7 @@ jobs:
             https://github.com/LiveContainer/dylibify/releases/download/1.0/dylibify
           chmod +x dylibify
 
-      - name: Configure official SideStore nightly
+      - name: SideStoreの取得元を公式Nightlyに変更
         shell: bash
         run: |
           set -e
@@ -129,27 +129,24 @@ jobs:
             exit 1
           fi
 
-      - name: Build IPA with official LiveContainer integration script
+      - name: 公式統合スクリプトでIPAをビルド
         shell: bash
         run: |
           set -e
 
           sh .github/build_github.sh
 
-      - name: Verify generated IPAs
+      - name: 生成された統合版IPAを確認
         shell: bash
         run: |
           set -e
 
-          test -f "LiveContainer.ipa"
           test -f "LiveContainer+SideStore.ipa"
 
-          echo "Generated files:"
-          ls -lh \
-            "LiveContainer.ipa" \
-            "LiveContainer+SideStore.ipa"
+          echo "Generated file:"
+          ls -lh "LiveContainer+SideStore.ipa"
 
-      - name: Verify integrated official SideStore
+      - name: 統合された公式SideStoreを検証
         shell: bash
         run: |
           set -e
@@ -184,14 +181,13 @@ jobs:
 
           echo "Official SideStore integration verified."
 
-      - name: Calculate SHA256
+      - name: SHA256を計算
         shell: bash
         run: |
           echo "SHA256:"
-          shasum -a 256 "LiveContainer.ipa"
           shasum -a 256 "LiveContainer+SideStore.ipa"
 
-      - name: Create build information
+      - name: ビルド情報を作成
         shell: bash
         run: |
           {
@@ -223,21 +219,12 @@ jobs:
 
             echo
             echo "SHA256:"
-            shasum -a 256 "LiveContainer.ipa"
             shasum -a 256 "LiveContainer+SideStore.ipa"
           } > build-info.txt
 
           cat build-info.txt
 
-      - name: Upload LiveContainer IPA
-        uses: actions/upload-artifact@v7
-        with:
-          name: LiveContainer
-          path: LiveContainer.ipa
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload LiveContainer + SideStore IPA
+      - name: LiveContainer + SideStore IPAをアップロード
         uses: actions/upload-artifact@v7
         with:
           name: LiveContainer-plus-SideStore
@@ -245,7 +232,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload build information
+      - name: ビルド情報をアップロード
         uses: actions/upload-artifact@v7
         with:
           name: build-info
@@ -253,7 +240,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Job summary
+      - name: ジョブサマリーを出力
         shell: bash
         run: |
           {
@@ -269,4 +256,3 @@ jobs:
             cat build-info.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
