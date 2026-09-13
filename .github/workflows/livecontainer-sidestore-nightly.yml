@@ -1,11 +1,11 @@
-name: LiveContainer + 公式SideStore Nightlyビルド
+name: LiveContainer + SideStore Nightlyビルド
 
 on:
   workflow_dispatch:
 
-  schedule:
+  #schedule:
     # Every day at 23:00 UTC = 08:00 JST (next day)
-    - cron: "0 23 * * *"
+    # - cron: "0 23 * * *"
 
 permissions:
   contents: read
